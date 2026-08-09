@@ -52,6 +52,10 @@
         "title": "Connect AI: ⚙️ 설정 열기"
       },
       {
+        "command": "connect-ai-lab.showBridgeToken",
+        "title": "Connect AI: 🔑 브릿지(4825) 토큰 복사"
+      },
+      {
         "command": "connect-ai-lab.enterPlaza",
         "title": "Connect AI: 🏛️ 에이전트 광장 입장/퇴장"
       },

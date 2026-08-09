@@ -4,6 +4,7 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 
 // ============================================================
@@ -13,6 +14,42 @@ import { spawn, spawnSync } from 'child_process';
 const MAX_HTTP_BODY = 5 * 1024 * 1024; // 5MB cap on /api/* request bodies
 const MAX_STREAM_BUFFER = 2 * 1024 * 1024; // 2MB cap on per-stream line buffer
 const MAX_FILE_NAME_LEN = 200;
+
+/* ------------------------------------------------------------------------
+ * Bridge server pairing token (port 4825)
+ *
+ * The bridge binds to 127.0.0.1, but that alone doesn't stop a malicious
+ * web page open in the user's browser from calling it — with
+ * Access-Control-Allow-Origin: * and no auth, ANY site the user visits
+ * could POST to /api/exam or read /ping's config dump. A random per-install
+ * token closes that hole: only a caller that already knows the token
+ * (i.e. the user, pasting it into whatever website they intentionally
+ * paired) can talk to the bridge. Stored in globalState — never touched by
+ * the brain/company git sync, so it can't leak through auto-commit either.
+ * ---------------------------------------------------------------------- */
+let _bridgeTokenCache: string | null = null;
+function getOrCreateBridgeToken(context: vscode.ExtensionContext): string {
+    if (_bridgeTokenCache) return _bridgeTokenCache;
+    let token = context.globalState.get<string>('bridgeAuthToken') || '';
+    if (!token) {
+        token = crypto.randomBytes(24).toString('base64url');
+        void context.globalState.update('bridgeAuthToken', token);
+    }
+    _bridgeTokenCache = token;
+    return token;
+}
+
+/** True if the request carries the correct bridge token (header or ?token= query param). */
+function isBridgeRequestAuthorized(req: any, expectedToken: string): boolean {
+    const headerToken = req.headers?.['x-connect-ai-token'];
+    if (typeof headerToken === 'string' && headerToken === expectedToken) return true;
+    try {
+        const url = new URL(req.url || '', 'http://127.0.0.1');
+        const queryToken = url.searchParams.get('token');
+        if (queryToken && queryToken === expectedToken) return true;
+    } catch { /* malformed URL — falls through to unauthorized */ }
+    return false;
+}
 
 /**
  * Run a git subcommand with argv form (no shell interpolation).
@@ -465,10 +502,21 @@ function ensureInitialCommit(cwd: string) {
 }
 
 /** Auto-create a sensible .gitignore in the brain folder so junk files don't pollute the remote. */
+/* Secrets that must never reach a git commit — API keys, OAuth secrets, bot
+   tokens. The docs promise each agent's config.md is protected by
+   .gitignore (see COMPANY_SYSTEM_MD's "동기화 정책"), so the generated
+   .gitignore has to actually say so, not just the prompt text. */
+const SECRET_GITIGNORE_PATTERNS = [
+    '_agents/*/config.md',
+    '_agents/*/tools/*.json',
+    '_cache/',
+    '.env',
+    '*.env'
+];
+
 function ensureBrainGitignore(brainDir: string) {
     const gi = path.join(brainDir, '.gitignore');
-    if (fs.existsSync(gi)) return;
-    const lines = [
+    const baseLines = [
         '# Connect AI auto-generated',
         '.DS_Store',
         '.obsidian/',
@@ -477,10 +525,41 @@ function ensureBrainGitignore(brainDir: string) {
         '*.tmp',
         '*.log',
         '.cache/',
-        'Thumbs.db'
+        'Thumbs.db',
+        '',
+        '# Secrets — never sync these to GitHub',
+        ...SECRET_GITIGNORE_PATTERNS
     ];
-    try { fs.writeFileSync(gi, lines.join('\n') + '\n'); }
-    catch { /* non-fatal */ }
+
+    if (!fs.existsSync(gi)) {
+        try { fs.writeFileSync(gi, baseLines.join('\n') + '\n'); }
+        catch { /* non-fatal */ }
+        return;
+    }
+
+    // Existing .gitignore (older brain, or user-edited) — patch in any
+    // missing secret patterns instead of silently trusting it's up to date.
+    try {
+        const existing = fs.readFileSync(gi, 'utf-8');
+        const existingLines = new Set(existing.split(/\r?\n/).map(l => l.trim()));
+        const missing = SECRET_GITIGNORE_PATTERNS.filter(p => !existingLines.has(p));
+        if (missing.length > 0) {
+            const patch = '\n# Connect AI — secrets (auto-added)\n' + missing.join('\n') + '\n';
+            fs.appendFileSync(gi, patch);
+        }
+    } catch { /* non-fatal */ }
+}
+
+/* If a secret file was ever committed before ensureBrainGitignore learned
+   about it (older brain, or the .gitignore wasn't there yet), gitignore
+   alone won't stop it from being tracked — git keeps syncing files it
+   already knows about even after they're ignored. Untrack them from the
+   index (working tree files are untouched) so the next commit finally
+   drops them, and future ones can't re-add them since they're ignored. */
+function untrackSecretsFromGit(dir: string) {
+    for (const pattern of SECRET_GITIGNORE_PATTERNS) {
+        gitExecSafe(['rm', '-r', '--cached', '--ignore-unmatch', pattern], dir, 10000);
+    }
 }
 
 /** Run a git subcommand and return stdout/stderr/status — used when we need to inspect failures. */
@@ -7610,6 +7689,7 @@ async function _safeGitAutoSync(brainDir: string, commitMsg: string, provider: a
         }
 
         ensureBrainGitignore(brainDir);
+        untrackSecretsFromGit(brainDir);
         ensureInitialCommit(brainDir);
 
         // Stage + commit any new local work. "nothing to commit" is fine.
@@ -7718,6 +7798,7 @@ async function _safeGitAutoSyncCompany(commitMsg: string, provider: any = null) 
             }
         }
         ensureBrainGitignore(companyDir); // same boilerplate ignore is fine here
+        untrackSecretsFromGit(companyDir);
         ensureInitialCommit(companyDir);
         gitExecSafe(['add', '.'], companyDir);
         gitExecSafe(['commit', '-m', commitMsg], companyDir);
@@ -8005,10 +8086,11 @@ export function activate(context: vscode.ExtensionContext) {
     // EZER AI <-> Connect AI Bridge Server (Port 4825)
     // ==========================================
     try {
+        const bridgeToken = getOrCreateBridgeToken(context);
         const server = http.createServer((req, res) => {
-            res.setHeader('Access-Control-Allow-Origin', '*'); 
+            res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Connect-AI-Token');
 
             if (req.method === 'OPTIONS') {
                 res.writeHead(200);
@@ -8016,23 +8098,42 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
+            const authorized = isBridgeRequestAuthorized(req, bridgeToken);
+
             if (req.method === 'GET' && req.url === '/ping') {
-                const brainDir = _getBrainDir();
-                const brainCount = fs.existsSync(brainDir) ? provider._findBrainFiles(brainDir).length : 0;
+                /* /ping stays reachable without a token — it's used for the
+                   same-machine "is another Connect AI already on 4825?"
+                   handshake. But it must not hand out config/brain details
+                   to an unauthenticated caller (e.g. a random web page),
+                   so those only appear once the token checks out. */
                 res.writeHead(200, { 'Content-Type': 'application/json' });
-                /* v2.89.127 — 신원·버전 정보 추가. 다른 Connect AI 인스턴스가 충돌 시
-                   이 응답 보고 "우리 거다 → 조용히 공유 모드 / 옛 버전이면 자동 인계" 판단. */
-                res.end(JSON.stringify({
+                const base: any = {
                     status: 'ok',
                     msg: 'Connect AI Bridge Ready',
                     app: 'connect-ai-bridge',
                     version: _CONNECT_AI_VERSION,
-                    pid: process.pid,
-                    config: getConfig(),
-                    brain: { fileCount: brainCount, enabled: provider._brainEnabled }
-                }));
+                    pid: process.pid
+                };
+                if (authorized) {
+                    const brainDir = _getBrainDir();
+                    const brainCount = fs.existsSync(brainDir) ? provider._findBrainFiles(brainDir).length : 0;
+                    base.config = getConfig();
+                    base.brain = { fileCount: brainCount, enabled: provider._brainEnabled };
+                }
+                res.end(JSON.stringify(base));
+                return;
             }
-            else if (req.method === 'POST' && req.url === '/api/exam') {
+
+            if (!authorized) {
+                /* Every other endpoint can trigger local LLM calls, inject chat
+                   messages, or read/write brain content — never serve those to
+                   an unpaired caller, CORS wildcard or not. */
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'unauthorized: missing or invalid X-Connect-AI-Token' }));
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/api/exam') {
                 (async () => {
                     try {
                         const body = await readRequestBody(req);
@@ -9046,6 +9147,14 @@ export function activate(context: vscode.ExtensionContext) {
             catch (e: any) {
                 vscode.window.showErrorMessage(`설정 메뉴 열기 실패: ${e?.message || e}`);
             }
+        }),
+        /* Bridge(포트 4825) 페어링 토큰 조회 — Agent University 웹처럼 브릿지를
+           호출해야 하는 곳에 X-Connect-AI-Token 헤더(또는 ?token=)로 붙여준다.
+           토큰을 모르면 /ping 외 모든 브릿지 엔드포인트가 401을 반환한다. */
+        vscode.commands.registerCommand('connect-ai-lab.showBridgeToken', async () => {
+            const token = getOrCreateBridgeToken(context);
+            await vscode.env.clipboard.writeText(token);
+            vscode.window.showInformationMessage(`🔑 브릿지 토큰이 클립보드에 복사되었습니다 (요청 헤더: X-Connect-AI-Token). 절대 공개 저장소나 채팅에 붙여넣지 마세요.`);
         }),
         /* 회사 폴더 위치 변경 — 두뇌 안 nested vs 완전 분리 선택 */
         vscode.commands.registerCommand('connect-ai-lab.changeCompanyDir', async () => {
